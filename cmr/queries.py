@@ -25,6 +25,27 @@ from urllib.parse import quote
 
 import requests
 from dateutil.parser import parse as dateutil_parse
+from requests import PreparedRequest, Request, Response, Session
+from requests.structures import CaseInsensitiveDict
+from typing_extensions import (
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+)
+
+_A = TypeVar("_A")
+_S = TypeVar("_S")
+
+PageParser: TypeAlias = Callable[[Response], Iterable[_A]]
+PaginationState: TypeAlias = Tuple[Session, Response, Optional[str]]
 
 CMR_OPS = "https://cmr.earthdata.nasa.gov/search/"
 CMR_UAT = "https://cmr.uat.earthdata.nasa.gov/search/"
@@ -37,6 +58,104 @@ DayNightFlag: TypeAlias = Union[
 FloatLike: TypeAlias = Union[str, SupportsFloat]
 PointLike: TypeAlias = Tuple[FloatLike, FloatLike]
 
+from itertools import chain, repeat
+
+
+def hits(response: Response) -> int:
+    try:
+        return int(response.headers["CMR-Hits"])
+    except Exception:
+        return NotImplemented
+
+
+class itemize(Iterator[_A]):
+
+    def __init__(
+        self,
+        request: Request,
+        *,
+        session: Optional[Session] = None,
+        parse: PageParser[_A],
+    ) -> None:
+        pages = paginate(request, session)
+
+        # Generate tuples of (hits, item) for every item on every page.  While 'hits'
+        # is constant for each page, and will likely remain the same across all pages,
+        # there is a possibility that it could change between pages due to someone else
+        # concurrently adding or removing items that match the search criteria.
+        hiterator = (zip(repeat(hits(page)), parse(page)) for page in pages)
+
+        # Generate tuples of (hits, index, item) for every item across all pages.  The
+        # 'index' is the index of the item across all pages, letting us know how far we
+        # have advanced across the entirety of the search results.  Keeping both 'hits'
+        # and 'index' with each item allows us to compute a length hint at every point
+        # during iteration.
+        self._state: Iterator[Tuple[int, int, _A]] = (
+            (hits, index, item)
+            for index, (hits, item) in enumerate(chain.from_iterable(hiterator))
+        )
+
+    def __next__(self) -> _A:
+        _, _, item = next(self._state)
+        return item
+
+    def __length_hint__(self) -> int:
+        # We simply want to "peek" at the next state so we can compute a length hint,
+        # but we don't want to consume the state, otherwise the next call to __next__
+        # will end up skipping the item we peeked at, so we must restore the state.
+        hits, index, item = next(self._state)
+        self._state = chain([(hits, index, item)], self._state)
+
+        return hits - index
+
+
+def paginate(
+    request: Request,
+    session: Optional[Session] = None,
+    **send_kwargs: Any,
+) -> Iterator[Response]:
+    session = session or Session()
+    prepared_request = session.prepare_request(request)
+    # prepared_request.prepare_url(request.url, {**request.params, "page_size": 2000})
+    first_page = session.send(prepared_request, **(send_kwargs or {}))
+    first_page.raise_for_status()
+    cmr_search_after = first_page.headers.get("cmr-search-after")
+
+    yield first_page
+    yield from unfold(next_page, (session, first_page, cmr_search_after))
+
+
+def unfold(f: Callable[[_S], Optional[Tuple[_A, _S]]], state: _S) -> Iterator[_A]:
+    while t := f(state):
+        a, state = t
+        yield a
+
+
+def with_headers(
+    request: PreparedRequest, headers: Mapping[str, str]
+) -> PreparedRequest:
+    request = request.copy()
+    request.headers = CaseInsensitiveDict(request.headers, **headers)
+
+    return request
+
+
+def next_page(state: PaginationState) -> Optional[Tuple[Response, PaginationState]]:
+    session, response, cmr_search_after = state
+
+    if not cmr_search_after:
+        return None
+
+    request = with_headers(response.request, {"cmr-search-after": cmr_search_after})
+    response = session.send(request)
+    response.raise_for_status()
+
+    return response, (session, response, response.headers.get("cmr-search-after"))
+
+
+class QueryError(requests.RequestException):
+    pass
+
 class Query:
     """
     Base class for all CMR queries.
@@ -46,8 +165,15 @@ class Query:
     _route = ""
     _format = "json"
     _valid_formats_regex = [
-        "json", "xml", "echo10", "iso", "iso19115",
-        "csv", "atom", "kml", "native"
+        "json",
+        "xml",
+        "echo10",
+        "iso",
+        "iso19115",
+        "csv",
+        "atom",
+        "kml",
+        "native",
     ]
 
     def __init__(self, route: str, mode: str = CMR_OPS):
@@ -57,6 +183,9 @@ class Query:
         self.mode(mode)
         self.concept_id_chars: Set[str] = set()
         self.headers: MutableMapping[str, str] = {}
+
+    def build(self) -> Request:
+        return Request("GET", self._build_url(), headers=self.headers)
 
     def get(self, limit: int = 2000) -> Sequence[Any]:
         """
@@ -180,8 +309,12 @@ class Query:
 
         # last chance validation for parameters
         if not self._valid_state():
-            raise RuntimeError(("Spatial parameters must be accompanied by a collection "
-                                "filter (ex: short_name or entry_title)."))
+            raise RuntimeError(
+                (
+                    "Spatial parameters must be accompanied by a collection "
+                    "filter (ex: short_name or entry_title)."
+                )
+            )
 
         # encode params
         formatted_params = []
@@ -390,8 +523,12 @@ class GranuleCollectionBaseQuery(Query):
 
             return date.strftime(iso_8601)
 
-        date_from = convert_to_string(date_from, datetime(1, 1, 1, 0, 0, 0, tzinfo=timezone.utc))
-        date_to = convert_to_string(date_to, datetime(1, 12, 31, 23, 59, 59, tzinfo=timezone.utc))
+        date_from = convert_to_string(
+            date_from, datetime(1, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        )
+        date_to = convert_to_string(
+            date_to, datetime(1, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+        )
 
         # if we have both dates, make sure from isn't later than to
         if date_from and date_to and date_from > date_to:
@@ -404,9 +541,7 @@ class GranuleCollectionBaseQuery(Query):
         self.params["temporal"].append(f"{date_from},{date_to}")
 
         if exclude_boundary:
-            self.options["temporal"] = {
-                "exclude_boundary": True
-            }
+            self.options["temporal"] = {"exclude_boundary": True}
 
         return self
 
